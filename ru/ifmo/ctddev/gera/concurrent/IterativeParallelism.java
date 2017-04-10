@@ -1,49 +1,85 @@
 package ru.ifmo.ctddev.gera.concurrent;
 
 import info.kgeorgiy.java.advanced.concurrent.ListIP;
+import info.kgeorgiy.java.advanced.mapper.ParallelMapper;
 
 import java.util.*;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Created by penguinni on 17.03.17.
  */
 public class IterativeParallelism implements ListIP {
-    private <T, U> U runThem(int amount,
-                             List<? extends T> values,
-                             Function<List<? extends T>, Worker<T, U>> ctor) throws InterruptedException {
-        List<Worker<T, U>> workers = new ArrayList<>();
-        int pack = values.size() / amount,
-            mod = values.size() % amount,
-            start = 0, end;
+    private final ParallelMapper mapper;
 
-        for (int i = 0; i < amount; i++) {
-            if (start == values.size()) {
+    public IterativeParallelism() {
+        this.mapper = null;
+    }
+    public IterativeParallelism(ParallelMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    private <T> Stream<T> toStream(List<T> args) {
+        return args.stream();
+    }
+
+    private <T> List<List<T>> split(List<T> args, int chunks) {
+        List<List<T>> result = new ArrayList<>();
+        int pack = args.size() / chunks,
+                mod = args.size() % chunks,
+                start = 0, end;
+
+        for (int i = 0; i < chunks; i++) {
+            if (start == args.size()) {
                 break;
             }
-            end = Math.min(start + pack, values.size()) + (mod-- > 0 ? 1 : 0);
-            workers.add(ctor.apply(values.subList(start, end)));
+            end = Math.min(start + pack, args.size()) + (mod-- > 0 ? 1 : 0);
+            result.add(args.subList(start, end));
             start = end;
         }
 
-        List<Thread> threads = new ArrayList<>();
-        for (Worker<T, U> w : workers) {
-            Thread t = new Thread(w);
-            threads.add(t);
-            t.start();
+        return result;
+    }
+
+    private <T, R> R makeParallel(int amount, List<T> args,
+                                  Function<List<T>, R> f,
+                                  Function<List<R>, R> collector) throws InterruptedException {
+
+        List<List<T>> tasks = split(args, amount);
+        List<R> results = new ArrayList<>();
+
+        if (mapper == null) {
+            List<Worker<T, R>> workers = new ArrayList<>();
+            tasks.forEach(task -> workers.add(new Worker<>(f, task)));
+
+            List<Thread> threads = new ArrayList<>();
+            for (Worker<T, R> worker : workers) {
+                Thread t = new Thread(worker);
+                threads.add(t);
+                t.start();
+            }
+            for (Thread t : threads) {
+                t.join();
+            }
+
+            for (Worker<T, R> worker : workers) {
+                results.add(worker.result);
+            }
+        } else {
+            results = mapper.map(f, tasks);
         }
 
-        for (Thread t : threads) {
-            t.join();
-        }
-
-        return ctor.apply(Collections.emptyList()).getFinalResult(workers);
+        return collector.apply(results);
     }
 
     @Override
     public <T> T maximum(int threads, List<? extends T> values, Comparator<? super T> comparator) throws InterruptedException {
-        return runThem(threads, values, (v) -> new Max<>(v, comparator));
+        return makeParallel(threads, values,
+                task -> Collections.max(task, comparator),
+                result -> Collections.max(result, comparator));
     }
 
     @Override
@@ -53,7 +89,9 @@ public class IterativeParallelism implements ListIP {
 
     @Override
     public <T> boolean all(int threads, List<? extends T> values, Predicate<? super T> predicate) throws InterruptedException {
-        return runThem(threads, values, (v) -> new All<>(v, predicate));
+        return makeParallel(threads, values,
+                task -> toStream(task).allMatch(predicate),
+                result -> toStream(result).allMatch(x -> x));
     }
 
     @Override
@@ -63,16 +101,40 @@ public class IterativeParallelism implements ListIP {
 
     @Override
     public String join(int threads, List<?> values) throws InterruptedException {
-        return runThem(threads, values, (v) -> new Join<>(v));
+        return makeParallel(threads, values,
+                task -> toStream(task).map(Object::toString).reduce(String::concat).orElse(null),
+                result -> toStream(result).reduce(String::concat).orElse(null));
     }
 
     @Override
     public <T> List<T> filter(int threads, List<? extends T> values, Predicate<? super T> predicate) throws InterruptedException {
-        return runThem(threads, values, (v) -> new Filter<>(v, predicate));
+        return makeParallel(threads, values,
+                task -> toStream(task).filter(predicate).collect(Collectors.toList()),
+                result -> toStream(result).reduce((r1, r2) -> Stream.concat(
+                        toStream(r1), toStream(r2)).collect(Collectors.toList())).orElse(null));
     }
 
     @Override
     public <T, U> List<U> map(int threads, List<? extends T> values, Function<? super T, ? extends U> f) throws InterruptedException {
-        return runThem(threads, values, (v) -> new Map<>(v, f));
+        return makeParallel(threads, values,
+                task -> toStream(task).map(f).collect(Collectors.toList()),
+                result -> toStream(result).map(List::stream)
+                        .reduce(Stream::concat).orElse(null).collect(Collectors.toList()));
+    }
+
+    private class Worker<T, R> implements Runnable {
+        private final Function<List<T>, R> f;
+        private final List<T> args;
+        private R result;
+
+        Worker(Function<List<T>, R> f, List<T> args) {
+            this.f = f;
+            this.args = args;
+        }
+
+        @Override
+        public void run() {
+            result = f.apply(args);
+        }
     }
 }
